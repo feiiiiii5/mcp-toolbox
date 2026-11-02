@@ -108,6 +108,22 @@ func InitializeConfigs(ctx context.Context, cfg ServerConfig) (
 		return nil, nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("failed to get logger from context: %w", err)
 	}
 
+	// Check source and tool types against TOOLBOX_ALLOWED_SOURCES and
+	// TOOLBOX_DISALLOWED_TOOLS. This runs before any source opens a
+	// connection. When neither variable is set, nothing is restricted.
+	restrictions := restrictionsFromEnv()
+	if restrictions.active() {
+		if restrictions.allowedSources != nil {
+			l.DebugContext(ctx, fmt.Sprintf("%s is set; allowed source types: %s", AllowedSourcesEnvVar, strings.Join(sortedKeys(restrictions.allowedSources), ", ")))
+		}
+		if len(restrictions.disallowedTools) > 0 {
+			l.DebugContext(ctx, fmt.Sprintf("%s is set; disallowed tool types: %s", DisallowedToolsEnvVar, strings.Join(sortedKeys(restrictions.disallowedTools), ", ")))
+		}
+		if err := restrictions.validate(cfg); err != nil {
+			return nil, nil, nil, nil, nil, nil, nil, nil, err
+		}
+	}
+
 	// initialize and validate the sources from configs
 	sourcesMap := make(map[string]sources.Source)
 	for name, sc := range cfg.SourceConfigs {
