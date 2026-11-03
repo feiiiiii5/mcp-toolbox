@@ -18,23 +18,88 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"reflect"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/googleapis/mcp-toolbox/internal/testutils"
 	"github.com/googleapis/mcp-toolbox/tests"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
 )
 
+// If DGRAPH_URL is set, use that instance; otherwise start an ephemeral container.
 var (
 	DgraphSourceType = "dgraph"
 	DgraphApiKey     = "api-key"
 	DgraphUrl        = os.Getenv("DGRAPH_URL")
 )
+
+// Standalone image runs dgraph zero and alpha in one container.
+const dgraphImage = "dgraph/standalone:v25.5.1"
+
+// setupDgraphContainer starts an ephemeral Dgraph container and returns its URL.
+func setupDgraphContainer(ctx context.Context, t *testing.T) string {
+	t.Helper()
+
+	token := strings.ReplaceAll(uuid.New().String(), "-", "")
+	req := testcontainers.ContainerRequest{
+		Image: dgraphImage,
+		// Same as the image's run.sh, plus a random admin token so /alter and /admin aren't open.
+		// The tests only query, so they never need it. It's a hex UUID, so interpolation is safe.
+		Entrypoint: []string{"sh", "-c"},
+		Cmd:        []string{fmt.Sprintf("dgraph zero & exec dgraph alpha --security 'token=%s;whitelist=0.0.0.0/0'", token)},
+		// Publish only the HTTP port.
+		ExposedPorts: []string{"8080/tcp"},
+		WaitingFor: wait.ForHTTP("/health").WithPort("8080/tcp").
+			WithResponseMatcher(func(body io.Reader) bool {
+				b, err := io.ReadAll(body)
+				return err == nil && strings.Contains(string(b), `"status":"healthy"`)
+			}).
+			WithStartupTimeout(3 * time.Minute),
+	}
+
+	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: req,
+		Started:          true,
+	})
+	// Register before checking err: a container can be returned alongside an error.
+	testcontainers.CleanupContainer(t, container)
+	if err != nil {
+		t.Fatalf("failed to start Dgraph container: %s", err)
+	}
+
+	host, err := container.Host(ctx)
+	if err != nil {
+		t.Fatalf("failed to get Dgraph container host: %s", err)
+	}
+	mappedPort, err := container.MappedPort(ctx, "8080/tcp")
+	if err != nil {
+		t.Fatalf("failed to get Dgraph container mapped port: %s", err)
+	}
+	return fmt.Sprintf("http://%s:%s", host, mappedPort.Port())
+}
+
+// useDgraph points DgraphUrl at an ephemeral container unless DGRAPH_URL is set.
+func useDgraph(ctx context.Context, t *testing.T) {
+	t.Helper()
+	if DgraphUrl != "" {
+		return
+	}
+	t.Logf("DGRAPH_URL not set; starting ephemeral %s container", dgraphImage)
+	url := setupDgraphContainer(ctx, t)
+	// Restore the global so repeated runs (-count>1) start a fresh container.
+	origUrl := DgraphUrl
+	t.Cleanup(func() { DgraphUrl = origUrl })
+	DgraphUrl = url
+}
 
 func getDgraphVars(t *testing.T) map[string]any {
 	if DgraphUrl == "" {
@@ -48,9 +113,11 @@ func getDgraphVars(t *testing.T) map[string]any {
 }
 
 func TestDgraphToolEndpoints(t *testing.T) {
-	sourceConfig := getDgraphVars(t)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+
+	useDgraph(ctx, t)
+	sourceConfig := getDgraphVars(t)
 
 	args := []string{"--enable-api"}
 
